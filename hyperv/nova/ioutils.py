@@ -27,7 +27,7 @@ from hyperv.nova import vmutils
 
 LOG = logging.getLogger(__name__)
 
-Queue = patcher.original('Queue')
+Queue = patcher.original('queue')
 
 if sys.platform == 'win32':
     from ctypes import wintypes

@@ -43,8 +43,8 @@ VHD_HEADER_SIZE_DYNAMIC = 512
 VHD_FOOTER_SIZE_DYNAMIC = 512
 VHD_BLK_SIZE_OFFSET = 544
 
-VHD_SIGNATURE = 'conectix'
-VHDX_SIGNATURE = 'vhdxfile'
+VHD_SIGNATURE = b'conectix'
+VHDX_SIGNATURE = b'vhdxfile'
 
 
 class VHDUtils(object):
