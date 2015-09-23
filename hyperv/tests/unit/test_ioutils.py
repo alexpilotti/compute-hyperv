@@ -36,14 +36,14 @@ class IOUtilsTestCase(test_base.HyperVBaseTestCase):
     @mock.patch.object(ioutils.IOUtils, 'handle_last_error')
     def test_run_and_check_output(self, mock_handle_last_error):
         mock_func = mock.Mock()
-        mock_func.__name__ = mock.sentinel.func_name
+        mock_func.__name__ = mock.sentinel.__name__
 
         ret_val = self._ioutils._run_and_check_output(
             mock_func, error_codes=[mock_func()],
             ignored_error_codes=mock.sentinel.ignored_error_codes)
 
         mock_handle_last_error.assert_called_once_with(
-            func_name=mock.sentinel.func_name,
+            func_name=mock.sentinel.__name__,
             ignored_error_codes=mock.sentinel.ignored_error_codes)
         self.assertEqual(mock_func(), ret_val)
 

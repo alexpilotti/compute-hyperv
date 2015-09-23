@@ -97,7 +97,7 @@ class VolumeOps(object):
         mapping = driver.block_device_info_get_mapping(block_device_info)
         block_devices = self._group_block_devices_by_type(
             mapping)
-        for driver_type, block_device_mapping in block_devices.items():
+        for driver_type, block_device_mapping in list(block_devices.items()):
             volume_driver = self._get_volume_driver(driver_type)
             volume_driver.disconnect_volumes(block_device_mapping)
 
@@ -252,7 +252,7 @@ class ISCSIVolumeDriver(object):
             target_iqn = vol['connection_info']['data']['target_iqn']
             iscsi_targets[target_iqn] += 1
 
-        for target_iqn, disconnected_luns in iscsi_targets.items():
+        for target_iqn, disconnected_luns in list(iscsi_targets.items()):
             self.logout_storage_target(target_iqn, disconnected_luns)
 
     def logout_storage_target(self, target_iqn, disconnected_luns_count=1):

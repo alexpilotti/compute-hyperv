@@ -43,7 +43,7 @@ def fake_db_instance(**updates):
         'tags': []
         }
 
-    for name, field in objects.Instance.fields.items():
+    for name, field in list(objects.Instance.fields.items()):
         if name in db_instance:
             continue
         if field.nullable:

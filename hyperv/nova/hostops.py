@@ -86,7 +86,7 @@ class HostOps(object):
         cpu_info['topology'] = topology
 
         features = list()
-        for fkey, fname in constants.PROCESSOR_FEATURE.items():
+        for fkey, fname in list(constants.PROCESSOR_FEATURE.items()):
             if self._hostutils.is_cpu_feature_present(fkey):
                 features.append(fname)
         cpu_info['features'] = features
@@ -222,7 +222,7 @@ class HostOps(object):
         # value is same as in libvirt
         return "%s up %s,  0 users,  load average: 0, 0, 0" % (
                    str(time.strftime("%H:%M:%S")),
-                   str(datetime.timedelta(milliseconds=long(tick_count64))))
+                   str(datetime.timedelta(milliseconds=int(tick_count64))))
 
     def host_maintenance_mode(self, host, mode):
         """Starts/Stops host maintenance. On start, it triggers
