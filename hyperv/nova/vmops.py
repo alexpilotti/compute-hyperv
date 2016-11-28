@@ -32,6 +32,7 @@ from nova.objects import fields
 from nova import utils
 from nova.virt import configdrive
 from nova.virt import hardware
+from nova.volume import cinder
 from os_win import constants as os_win_const
 from os_win import exceptions as os_win_exc
 from os_win import utilsfactory
@@ -62,6 +63,8 @@ CONF = nova.conf.CONF
 SHUTDOWN_TIME_INCREMENT = 5
 REBOOT_TYPE_SOFT = 'SOFT'
 REBOOT_TYPE_HARD = 'HARD'
+QUIESCE_SNAPSHOT_NAME = "Volumes snapshot"
+VOLUME_SNAPSHOT_LOCK_FMT = "volume-snapshot-%s"
 
 VM_GENERATIONS = {
     constants.IMAGE_PROP_VM_GEN_1: constants.VM_GEN_1,
@@ -101,6 +104,7 @@ class VMOps(object):
         self._block_dev_man = (
             block_device_manager.BlockDeviceInfoManager())
         self._pdk = pdk.PDK()
+        self._volume_api = cinder.API()
 
     def list_instance_uuids(self):
         instance_uuids = []
@@ -1223,3 +1227,200 @@ class VMOps(object):
         if not fsk_computer_name:
             fsk_pairs[fsk_computername_key] = instance.hostname
         return fsk_pairs
+
+    def quiesce(self, context, instance, image_meta):
+        LOG.debug("Quiescing instance: %s", instance.id)
+
+        @utils.synchronized(VOLUME_SNAPSHOT_LOCK_FMT % instance.id)
+        def _do_quiesce():
+            self._remove_quiesce_snapshots(instance.name)
+            self._vmutils.take_vm_snapshot(
+                instance.name, QUIESCE_SNAPSHOT_NAME)
+            self.suspend(instance)
+        _do_quiesce()
+
+    def unquiesce(self, context, instance, image_meta):
+        LOG.debug("Unquiescing instance: %s", instance.id)
+
+        @utils.synchronized(VOLUME_SNAPSHOT_LOCK_FMT % instance.id)
+        def _do_unquiesce():
+            self._remove_quiesce_snapshots(instance.name)
+            self.resume(instance)
+        _do_unquiesce()
+
+    def _remove_quiesce_snapshots(self, instance_name):
+        for snapshot_path in self._vmutils.get_vm_snapshots(
+                instance_name, QUIESCE_SNAPSHOT_NAME):
+            self._vmutils.remove_vm_snapshot(snapshot_path)
+
+    @contextlib.contextmanager
+    def _handle_quiescing_and_snapshot(self, instance, take_snapshot=False):
+        remove_snapshot = False
+        set_previous_state = False
+
+        try:
+            if take_snapshot:
+                if not self._vmutils.get_vm_snapshots(
+                        instance.name, QUIESCE_SNAPSHOT_NAME):
+                    self._vmutils.take_vm_snapshot(
+                        instance.name, QUIESCE_SNAPSHOT_NAME)
+                    remove_snapshot = True
+
+            curr_state = self._vmutils.get_vm_state(instance.name)
+            # TODO(alexpilotti): Check if in transitioning state
+            # e.g. shutting down
+            if curr_state not in [os_win_const.HYPERV_VM_STATE_DISABLED,
+                                  os_win_const.HYPERV_VM_STATE_SUSPENDED]:
+                # TODO(alexpilotti): pause instead of suspending for SCSI disks
+                self.suspend(instance)
+                set_previous_state = True
+            yield
+        finally:
+            if set_previous_state:
+                self._set_vm_state(instance, curr_state)
+            if remove_snapshot:
+                self._remove_quiesce_snapshots(instance.name)
+
+    def volume_snapshot_create(self, context, instance, volume_id,
+                               create_info):
+        LOG.debug("Creating snapshot for volume %(volume_id)s on instance "
+                  "%(instance_id)s with create info %(create_info)s" %
+                  {"volume_id": volume_id, "instance_id": instance.id,
+                   "create_info": create_info})
+
+        snapshot_id = create_info.get('snapshot_id')
+        if not snapshot_id:
+            raise exception.NovaException(
+                _('"snapshot_id" not present in create_info'))
+
+        @utils.synchronized(VOLUME_SNAPSHOT_LOCK_FMT % instance.id)
+        def _do_volume_snapshot_create():
+
+            with self._handle_quiescing_and_snapshot(instance,
+                                                     take_snapshot=True):
+                new_file = create_info.get('new_file')
+                if not new_file:
+                    raise exception.NovaException(
+                        _('"new_file" not present in create_info'))
+
+                disk_found = False
+                for path in self._vmutils.get_vm_storage_paths(
+                        instance.name)[0]:
+                    if os.path.basename(path).startswith(
+                            "volume-%s" % volume_id):
+                        new_path = os.path.join(
+                            os.path.dirname(path), new_file)
+                        self._pathutils.copyfile(path, new_path)
+                        self._pathutils.remove(path)
+
+                        self._vmutils.update_vm_disk_path(
+                            path, new_path, is_physical=False)
+                        disk_found = True
+                        break
+
+                if not disk_found:
+                    raise exception.DiskNotFound(location=new_file)
+
+                # Undate Cinder status
+                self._volume_api.update_snapshot_status(
+                    context, snapshot_id, 'creating')
+
+        try:
+            _do_volume_snapshot_create()
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE('Error occurred during '
+                                  'volume_snapshot_create, '
+                                  'sending error status to Cinder.'),
+                              instance=instance)
+                self._volume_api.update_snapshot_status(
+                    context, snapshot_id, 'error')
+
+    def volume_snapshot_delete(self, context, instance, volume_id,
+                               snapshot_id, delete_info):
+        LOG.debug("Deleting snapshot for volume %(volume_id)s on instance "
+                  "%(instance_id)s with delete info %(delete_info)s" %
+                  {"volume_id": volume_id, "instance_id": instance.id,
+                   "delete_info": delete_info})
+
+        @utils.synchronized(VOLUME_SNAPSHOT_LOCK_FMT % instance.id)
+        def _do_volume_snapshot_delete():
+            with self._handle_quiescing_and_snapshot(instance):
+                file_to_merge = delete_info.get('file_to_merge')
+                merge_target_file = delete_info.get('merge_target_file')
+
+                disk_found = False
+                for path in self._vmutils.get_vm_storage_paths(
+                        instance.name)[0]:
+                    if os.path.basename(path).startswith(
+                            "volume-%s" % volume_id):
+                        base_dir = os.path.dirname(path)
+                        parent_path = None
+
+                        if merge_target_file:
+                            parent_path = os.path.join(
+                                base_dir, merge_target_file)
+                            child_path = os.path.join(base_dir, file_to_merge)
+                        else:
+                            child_path = path
+
+                        curr_parent_path = self._vhdutils.get_vhd_parent_path(
+                            child_path)
+
+                        if not parent_path:
+                            parent_path = curr_parent_path
+                        elif curr_parent_path.lower() != parent_path.lower():
+                            LOG.exception(
+                                _("Parent path does not match for VHD "
+                                  "%(child_path)s. Current parent path: "
+                                  "%(curr_parent_path)s, expected parent "
+                                  "path: %(parent_path)s"),
+                                 {"child_path": child_path,
+                                  "parent_path": parent_path,
+                                  "curr_parent_path": curr_parent_path})
+
+                        if child_path != path:
+                            # Reconnect chain
+                            curr_path = path
+                            while True:
+                                curr_parent_path = (
+                                    self._vhdutils.get_vhd_parent_path(
+                                        curr_path))
+                                if not curr_parent_path:
+                                    raise exception.NovaException(
+                                        "Parent path not found in VHD chain")
+                                    break
+                                if curr_parent_path == child_path:
+                                    path_to_reconnect = curr_path
+                                    break
+                                curr_path = curr_parent_path
+
+                        self._vhdutils.merge_vhd(child_path)
+
+                        if child_path == path:
+                                self._pathutils.rename(parent_path, child_path)
+                        else:
+                            self._vhdutils.reconnect_parent_vhd(
+                                path_to_reconnect, parent_path)
+
+                        disk_found = True
+                        break
+
+                if not disk_found:
+                    raise exception.NovaException(
+                        _("Cannot find disk mapping for volume: %s") %
+                        volume_id)
+
+                # Undate Cinder status
+                self._volume_api.update_snapshot_status(
+                    context, snapshot_id, 'deleting')
+        try:
+            _do_volume_snapshot_delete()
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE('Error occurred during '
+                                  'volume_snapshot_delete, '
+                                  'sending error status to Cinder.'),
+                              instance=instance)
+                self._volume_api.update_snapshot_status(
+                    context, snapshot_id, 'error_deleting')
